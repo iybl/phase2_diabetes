@@ -513,6 +513,65 @@ print("\nRules that test number_inpatient (best lift first):")
 mask = rules["rule"].str.contains("number_inpatient") & (rules.test_matches >= MIN_RULE_MATCHES)
 print(rules[mask].sort_values("lift", ascending=False).head(6).to_string(index=False))
 
+# fairness / subgroup analysis 
+age_order = ["<40", "40-59", "60-69", "70-79", "80+"]
+attrs = {"age band": pd.cut(df2["age"], [0, 40, 60, 70, 80, 100], right=False, labels=age_order).astype(str),
+         "race": df2["race"].astype(str), "gender": df2["gender"].astype(str)}
+rows, excluded = [], []
+for model in ["eLCS improved", "Logistic regression"]:
+    te_, pr_, pb_ = pooled(model); yt_ = y[te_]
+    for aname, series in attrs.items():
+        s = series.to_numpy()[te_]
+        for lvl in sorted(set(s)):
+            mk = s == lvl
+            if mk.sum() < MIN_GROUP_N or yt_[mk].sum() < MIN_GROUP_EVENTS or (1 - yt_[mk]).sum() < MIN_GROUP_EVENTS:
+                excluded.append({"model": model, "attribute": aname, "group": lvl, "n": int(mk.sum()), "positives": int(yt_[mk].sum())})
+                continue
+            rows.append({"model": model, "attribute": aname, "group": lvl, "n": int(mk.sum()),
+                         "readmit rate": round(yt_[mk].mean(), 3), "flagged": round(pr_[mk].mean(), 3),
+                         "recall": round(recall_score(yt_[mk], pr_[mk]), 3),
+                         "precision": round(precision_score(yt_[mk], pr_[mk], zero_division=0), 3),
+                         "ROC-AUC": round(roc_auc_score(yt_[mk], pb_[mk]), 3)})
+fair = pd.DataFrame(rows)
+fair.to_csv(os.path.join(OUT_DIR, "fairness_by_subgroup.csv"), index=False)
+print(fair.to_string(index=False))
+if excluded:
+    ex = pd.DataFrame(excluded).drop_duplicates(["attribute", "group"])
+    ex.to_csv(os.path.join(OUT_DIR, "fairness_excluded_groups.csv"), index=False)
+    print("\nGroups too small to report:")
+    print(ex.to_string(index=False))
+
+
+# parameters, engineered dataset, final PASS/FAIL checklist 
+params = pd.DataFrame({"original eLCS": eLCS(random_state=1).get_params(),
+                       "improved eLCS": eLCS(random_state=1, learning_iterations=IMPROVED_ITERATIONS).get_params()}).astype(str)
+params.to_csv(os.path.join(OUT_DIR, "elcs_parameters.csv"))
+print(params.to_string())
+
+out = df2.copy(); out["readmitted_binary"] = y; out.insert(0, "patient_nbr", groups)
+assert not out.isna().any().any(), "Engineered dataset still contains missing values"
+out.to_csv(os.path.join(OUT_DIR, "diabetic_data_engineered.csv"), index=False)
+print("\nsaved diabetic_data_engineered.csv", out.shape,
+      "(fold-specific steps such as near-constant drug removal and feature selection are NOT applied here)")
+
+expected_files = ["fold_results.csv", "summary_means.csv", "results_table_mean_sd.csv", "rules_fold1.csv",
+                  "rule_coverage_fold1.csv", "fairness_by_subgroup.csv", "elcs_parameters.csv",
+                  "diabetic_data_engineered.csv", "confusion_matrices.csv", "cohort_summary.csv",
+                  "outlier_check.csv", "environment_versions.csv"]
+if k_folds >= 3:
+    expected_files += ["stats_friedman.csv", "stats_improved_vs_others.csv", "stats_ablation.csv"]
+checks = {"dataset shape 101,766 x 50": df_full.shape == EXPECTED_SHAPE,
+          "death/hospice IDs present and removed": int(excl_mask.sum()) > 0 and not df["discharge_disposition_id"].astype(str).isin(cannot_return).any(),
+          "positive rate in cohort (~11.4%)": 0.10 < y.mean() < 0.12,
+          "no patient overlap in any fold": all(not set(groups[a]) & set(groups[b]) for a, b in folds),
+          f"{len(folds)} fold(s) completed": fold_results["fold"].nunique() == len(folds),
+          "all models completed in every fold": all(fold_results.groupby("model")["fold"].nunique() == len(folds)),
+          "no NaN/inf in metrics": bool(np.isfinite(fold_results.drop(columns=["model"]).to_numpy(dtype=float)).all()),
+          "at least 3 informative rules (>=50 held-out matches)": int((rules.test_matches >= MIN_RULE_MATCHES).sum()) >= 3,
+          "fairness analysis completed": len(fair) > 0,
+          "all output files written": all(os.path.exists(os.path.join(OUT_DIR, f)) for f in expected_files)}
+for name, ok in checks.items():
+    print(("PASS  " if ok else "FAIL  ") + name)
 
 
 
