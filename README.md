@@ -117,3 +117,22 @@ if TEST_MODE:
     folds = folds[:1]
     print("TEST_MODE: using fold 1 only")
 
+# raw encoding helper 
+# Minimal processing, drop identifiers and the target, and
+# integer-label-encode text columns 
+RAW_DROP = ["encounter_id", "patient_nbr", "readmitted"]
+def label_encode(train_s, test_s):
+    mapping = {v: i for i, v in enumerate(pd.unique(train_s.astype(object).dropna()))}
+    n = len(mapping)
+    a = train_s.astype(object).map(mapping).astype(float).fillna(n)
+    b = test_s.astype(object).map(mapping).astype(float).fillna(n)
+    return a, b, mapping
+
+def encode_raw(frame, tr, te):
+    train_out, test_out = frame.iloc[tr].copy(), frame.iloc[te].copy()
+    for col in train_out.columns:
+        if not pd.api.types.is_numeric_dtype(train_out[col]):
+            train_out[col], test_out[col], _ = label_encode(train_out[col], test_out[col])
+    return train_out.astype(float).to_numpy(), test_out.astype(float).to_numpy()
+
+raw_df = df.drop(columns=RAW_DROP).copy()
