@@ -84,3 +84,36 @@ pd.DataFrame({
               int(y.sum()), round(pos_before, 4), round(y.mean(), 4), int(pd.Series(groups).nunique())]
 }).astype({"value": object}).to_csv(os.path.join(OUT_DIR, "cohort_summary.csv"), index=False)
 
+# outlier check 
+# Outliers are reported, not removed: high counts are plausible
+num_cols = ["time_in_hospital", "num_lab_procedures", "num_procedures", "num_medications",
+            "number_outpatient", "number_emergency", "number_inpatient", "number_diagnoses"]
+rows = []
+for c in num_cols:
+    s = pd.to_numeric(df[c], errors="coerce")
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    lo_b, hi_b = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    out_mask = (s < lo_b) | (s > hi_b)
+    rows.append({"feature": c, "median": s.median(), "p99": s.quantile(0.99), "max": s.max(),
+                 "n_outside_1.5IQR": int(out_mask.sum()), "pct_outside": round(100 * out_mask.mean(), 2)})
+outlier_table = pd.DataFrame(rows)
+print(outlier_table.to_string(index=False))
+outlier_table.to_csv(os.path.join(OUT_DIR, "outlier_check.csv"), index=False)
+
+
+
+# Patient-grouped, stratified 5-fold split 
+def make_folds(labels, grp):
+    return list(StratifiedGroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+                .split(np.zeros((len(labels), 1)), labels, grp))
+
+folds = make_folds(y, groups)
+for tr, te in folds:
+    assert not set(groups[tr]) & set(groups[te]), "Patient overlap between train and test!"
+print("fold sizes (train, test):", [(len(tr), len(te)) for tr, te in folds])
+print("positive rate per test fold:", [round(float(y[te].mean()), 4) for _, te in folds])
+if TEST_MODE:
+    folds = folds[:1]
+    print("TEST_MODE: using fold 1 only")
+
