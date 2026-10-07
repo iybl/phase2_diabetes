@@ -359,5 +359,57 @@ if RUN_FULL_COHORT_SENSITIVITY:
     print("\nSensitivity, raw eLCS on the full cohort (mean over folds):")
     print(sens.drop(columns=["fold", "model"]).mean().round(3).to_dict())
 
+# statistical tests: Friedman, corrected t-test, Holm
+TEST_METRICS = ["PR-AUC", "ROC-AUC", "bal_acc", "recall", "F1"]
+k_folds = len(folds)
+ratio = np.mean([len(te) / len(tr) for tr, te in folds])
+
+def nb_test(a, b):
+    """Nadeau-Bengio corrected resampled paired t-test on per-fold metric differences."""
+    d = (a - b).to_numpy(); var = d.var(ddof=1)
+    if var == 0:
+        return d.mean(), 1.0
+    t = d.mean() / np.sqrt((1 / k_folds + ratio) * var)
+    return d.mean(), 2 * stats.t.sf(abs(t), df=k_folds - 1)
+
+def holm(p):
+    p = np.asarray(p, dtype=float); order = np.argsort(p); adj = np.empty(len(p)); running = 0.0
+    for rank, i in enumerate(order):
+        running = max(running, (len(p) - rank) * p[i]); adj[i] = min(1.0, running)
+    return adj
+
+def pivot(metric):
+    return fold_results.pivot(index="fold", columns="model", values=metric)
+
+if k_folds < 3:
+    print("TEST_MODE (fewer than 3 folds): statistical tests skipped. Run the full 5-fold experiment for Cell 10.")
+else:
+    fr = []
+    for metric in TEST_METRICS:
+        piv = pivot(metric)[MAIN]
+        chi2, p_f = stats.friedmanchisquare(*[piv[m] for m in MAIN])
+        fr.append({"metric": metric, "chi2": round(chi2, 3), "p": round(p_f, 5)})
+        print(f"Friedman ({metric}): chi2 = {chi2:.2f}, p = {p_f:.5f}")
+    pd.DataFrame(fr).to_csv(os.path.join(OUT_DIR, "stats_friedman.csv"), index=False)
+    others = [m for m in ALL_MODELS if m != "eLCS improved"]
+    tabs = []
+    for metric in TEST_METRICS:
+        piv = pivot(metric); res = [nb_test(piv["eLCS improved"], piv[o]) for o in others]
+        tabs.append(pd.DataFrame({f"{metric} diff": [r[0] for r in res],
+                                  f"{metric} p (Holm)": holm([r[1] for r in res])}, index=others))
+    vs_others = pd.concat(tabs, axis=1).round(4)
+    vs_others.to_csv(os.path.join(OUT_DIR, "stats_improved_vs_others.csv"))
+    print("\nImproved eLCS vs each other model (diff > 0 means improved eLCS is higher):")
+    print(vs_others.to_string())
+    chain = ["eLCS raw", "eLCS cleaned", "eLCS balanced (10k)", "eLCS balanced + top12 (10k)", "eLCS improved"]
+    tabs = []
+    for metric in TEST_METRICS:
+        piv = pivot(metric); res = [nb_test(piv[b_], piv[a_]) for a_, b_ in zip(chain[:-1], chain[1:])]
+        tabs.append(pd.DataFrame({f"{metric} diff": [r[0] for r in res],
+                                  f"{metric} p (Holm)": holm([r[1] for r in res])}, index=[f"+ {b_}" for b_ in chain[1:]]))
+    ablation = pd.concat(tabs, axis=1).round(4)
+    ablation.to_csv(os.path.join(OUT_DIR, "stats_ablation.csv"))
+    print("\nAblation (each step vs the previous one):")
+    print(ablation.to_string())
 
 
