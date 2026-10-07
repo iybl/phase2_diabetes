@@ -235,6 +235,26 @@ def top_k_by_mutual_info(Xtr, ytr, discrete_mask, k=TOP_K_FEATURES):
     mi = mutual_info_classif(Xtr, ytr, discrete_features=discrete_mask, random_state=SEED)
     return list(np.argsort(mi)[::-1][:k])
 
+# class-balancing helper 
+def balanced_sample(idx, labels, rng):
+    idx = np.asarray(idx); labels = np.asarray(labels)
+    pos, neg = idx[labels[idx] == 1], idx[labels[idx] == 0]
+    assert len(neg) >= len(pos), "Fewer negatives than positives, cannot balance 1:1"
+    return rng.permutation(np.concatenate([pos, rng.choice(neg, size=len(pos), replace=False)]))
 
+
+# sanity check on fold 1
+tr, te = folds[0]
+p = preprocess_fold(tr, te)
+print("eLCS train/test:", p["Xtr_e"].shape, p["Xte_e"].shape)
+print("one-hot train/test:", p["Xtr_c"].shape, p["Xte_c"].shape)
+print("drug columns dropped:", len(p["near_constant"]))
+bal = balanced_sample(np.arange(len(tr)), y[tr], np.random.default_rng(BALANCE_SEED_BASE))
+assert len(set(groups[tr]) & set(groups[te])) == 0
+assert p["Xtr_e"].shape[1] == p["Xte_e"].shape[1] and p["Xtr_c"].shape[1] == p["Xte_c"].shape[1]
+assert abs(y[tr][bal].mean() - 0.5) < 1e-9, "Balanced sample is not 50/50"
+print("balanced rows:", len(bal), "| positive share:", y[tr][bal].mean())
+
+ 
 
 
