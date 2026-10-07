@@ -50,3 +50,37 @@ for pkg in ["numpy", "pandas", "scipy", "scikit-learn", "scikit-eLCS", "matplotl
 pd.Series(versions, name="version").to_csv(os.path.join(OUT_DIR, "environment_versions.csv"))
 print("TEST_MODE:", TEST_MODE, "| improved iterations:", IMPROVED_ITERATIONS)
 print(versions)
+
+# load data  & apply the cohort rule 
+# # "?" is the missing-value marker. Kept "None" as a category
+# A1Cresult / max_glu_serum, means "test not performed", NOT missing (Phase I treated it as missing).
+df_full = pd.read_csv(DATA_PATH, na_values=["?"], keep_default_na=False, low_memory=False)
+print("raw data:", df_full.shape)
+assert df_full.shape == EXPECTED_SHAPE, f"Unexpected dataset shape {df_full.shape}"
+for _c in ["encounter_id", "patient_nbr", "readmitted", "discharge_disposition_id", "age", "diag_1", "diag_2", "diag_3"]:
+    assert _c in df_full.columns, f"Column {_c} missing from the data file"
+print("fully duplicated rows:", int(df_full.duplicated().sum()),
+      "| duplicated encounter_id:", int(df_full["encounter_id"].duplicated().sum()),
+      "| unique patients:", df_full["patient_nbr"].nunique())
+print("A1Cresult:", df_full["A1Cresult"].value_counts(dropna=False).to_dict())
+print("max_glu_serum:", df_full["max_glu_serum"].value_counts(dropna=False).to_dict())
+
+# Patients who died or went to hospice cannot be readmitted, so they are excluded from the cohort.
+cannot_return = ["11", "13", "14", "19", "20", "21"]
+excl_mask = df_full["discharge_disposition_id"].astype(str).isin(cannot_return)
+assert excl_mask.sum() > 0, "Death/hospice IDs not found"
+print("\nremoved by discharge_disposition_id:",
+      df_full.loc[excl_mask, "discharge_disposition_id"].astype(str).value_counts().to_dict(),
+      "| total removed:", int(excl_mask.sum()))
+pos_before = (df_full["readmitted"] == "<30").mean()
+df = df_full[~excl_mask].reset_index(drop=True)
+y = (df["readmitted"] == "<30").astype(int).to_numpy()
+groups = df["patient_nbr"].to_numpy()
+print(f"cohort: {df.shape} | positives: {int(y.sum())} ({y.mean():.4f}) | positive rate before exclusion: {pos_before:.4f}")
+pd.DataFrame({
+    "item": ["rows_raw", "rows_removed_death_hospice", "rows_cohort", "positives_raw", "positives_cohort",
+             "pos_rate_raw", "pos_rate_cohort", "unique_patients_cohort"],
+    "value": [len(df_full), int(excl_mask.sum()), len(df), int((df_full["readmitted"] == "<30").sum()),
+              int(y.sum()), round(pos_before, 4), round(y.mean(), 4), int(pd.Series(groups).nunique())]
+}).astype({"value": object}).to_csv(os.path.join(OUT_DIR, "cohort_summary.csv"), index=False)
+
