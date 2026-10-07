@@ -573,6 +573,39 @@ checks = {"dataset shape 101,766 x 50": df_full.shape == EXPECTED_SHAPE,
 for name, ok in checks.items():
     print(("PASS  " if ok else "FAIL  ") + name)
 
+# patient-level bootstrap confidence intervals for subgroups
+# Resamples PATIENTS as one patient can contribute several encounters.
+rng = np.random.default_rng(SEED)
+te_, pr_, pb_ = pooled("eLCS improved")
+yt_, gt_ = y[te_], groups[te_]
+rows = []
+for aname, series in attrs.items():
+    s = series.to_numpy()[te_]
+    for lvl in sorted(set(s)):
+        idx = np.where(s == lvl)[0]
+        if len(idx) < MIN_GROUP_N:
+            continue
+        yy, pp, bb = yt_[idx], pr_[idx], pb_[idx]
+        uniq, inv = np.unique(gt_[idx], return_inverse=True)
+        order = np.argsort(inv, kind="stable")
+        members = np.split(order, np.cumsum(np.bincount(inv))[:-1])      # row positions for each patient
+        rec, auc = [], []
+        for _ in range(N_BOOT):
+            pick = rng.integers(0, len(members), len(members))
+            i = np.concatenate([members[j] for j in pick])
+            if yy[i].sum() == 0 or yy[i].sum() == len(i):
+                continue
+            rec.append(recall_score(yy[i], pp[i])); auc.append(roc_auc_score(yy[i], bb[i]))
+        if not rec:
+            continue
+        rows.append({"attribute": aname, "group": lvl, "n": len(idx), "patients": len(uniq), "positives": int(yy.sum()),
+                     "recall": round(recall_score(yy, pp), 3),
+                     "recall_lo": round(np.percentile(rec, 2.5), 3), "recall_hi": round(np.percentile(rec, 97.5), 3),
+                     "ROC-AUC": round(roc_auc_score(yy, bb), 3),
+                     "auc_lo": round(np.percentile(auc, 2.5), 3), "auc_hi": round(np.percentile(auc, 97.5), 3)})
+ci = pd.DataFrame(rows)
+ci.to_csv(os.path.join(OUT_DIR, "fairness_bootstrap_ci.csv"), index=False)
+print(ci.to_string(index=False))
 
 
 
