@@ -412,4 +412,16 @@ else:
     print("\nAblation (each step vs the previous one):")
     print(ablation.to_string())
 
+# confusion matrices (pooled over the test folds)
+def pooled(name):
+    return (np.concatenate([t for t, _, _ in oof[name]]), np.concatenate([p_ for _, p_, _ in oof[name]]),
+            np.concatenate([b for _, _, b in oof[name]]))
+
+cm_rows = []
+for name in ALL_MODELS:
+    te_, pr_, _ = pooled(name)
+    cm = confusion_matrix(y[te_], pr_, labels=[0, 1])
+    print(f"\n{name} (rows = actual 0/1, columns = predicted 0/1)\n{cm}")
+    cm_rows.append({"model": name, "TN": cm[0, 0], "FP": cm[0, 1], "FN": cm[1, 0], "TP": cm[1, 1]})
+pd.DataFrame(cm_rows).to_csv(os.path.join(OUT_DIR, "confusion_matrices.csv"), index=False)
 
