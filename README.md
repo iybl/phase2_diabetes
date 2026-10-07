@@ -324,5 +324,40 @@ fold_results = pd.DataFrame(all_rows)
 fold_results.to_csv(os.path.join(OUT_DIR, "fold_results.csv"), index=False)
 print(fold_results[["model", "acc", "bal_acc", "recall", "ROC-AUC", "PR-AUC", "fit_seconds", "predict_seconds"]].round(3).to_string(index=False))
 
+# results table and full-cohort sensitivity run
+summary = fold_results.drop(columns="fold").groupby("model").agg(["mean", "std"]).round(3)
+summary.to_csv(os.path.join(OUT_DIR, "summary_means.csv"))
+ALL_MODELS = [m for m in MAIN + MATCHED if m in oof]
+
+display_names = {"eLCS raw": "Original eLCS (raw)", "eLCS cleaned": "Original eLCS (preprocessed)",
+                 "eLCS balanced (10k)": "Balanced eLCS", "eLCS balanced + top12 (10k)": "Feature-selected eLCS",
+                 "eLCS improved": "Improved eLCS", "Logistic regression": "Logistic Regression",
+                 "Decision tree": "Decision Tree", "Random forest": "Random Forest"}
+cols = ["bal_acc", "ROC-AUC", "PR-AUC", "precision", "recall", "F1", "acc"]
+means = fold_results.groupby("model")[cols].mean()
+sds = fold_results.groupby("model")[cols].std()
+results_table = pd.DataFrame({c: [f"{means.loc[m, c]:.3f} ({sds.loc[m, c]:.3f})" for m in ALL_MODELS] for c in cols},
+                             index=[display_names.get(m, m) for m in ALL_MODELS])
+results_table.columns = ["Balanced Accuracy", "ROC-AUC", "PR-AUC", "Precision", "Recall", "F1", "Accuracy"]
+results_table.to_csv(os.path.join(OUT_DIR, "results_table_mean_sd.csv"))
+print("fold mean (sd):")
+print(results_table.to_string())
+
+if RUN_FULL_COHORT_SENSITIVITY:
+    y_all = (df_full["readmitted"] == "<30").astype(int).to_numpy()
+    g_all = df_full["patient_nbr"].to_numpy()
+    raw_all = df_full.drop(columns=RAW_DROP)
+    sens = []
+    for k, (tr_, te_) in enumerate(make_folds(y_all, g_all)):
+        assert not set(g_all[tr_]) & set(g_all[te_])
+        a, b = encode_raw(raw_all, tr_, te_)
+        m = eLCS(random_state=k + 1); m.fit(a, y_all[tr_])
+        sens.append({"fold": k + 1, "model": "eLCS raw (full cohort, no exclusion)",
+                     **metrics(y_all[te_], m.predict(b), m.predict_proba(b)[:, 1])})
+    sens = pd.DataFrame(sens)
+    sens.to_csv(os.path.join(OUT_DIR, "sensitivity_raw_full_cohort.csv"), index=False)
+    print("\nSensitivity, raw eLCS on the full cohort (mean over folds):")
+    print(sens.drop(columns=["fold", "model"]).mean().round(3).to_dict())
+
 
 
