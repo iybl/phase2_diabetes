@@ -425,3 +425,96 @@ for name in ALL_MODELS:
     cm_rows.append({"model": name, "TN": cm[0, 0], "FP": cm[0, 1], "FN": cm[1, 0], "TP": cm[1, 1]})
 pd.DataFrame(cm_rows).to_csv(os.path.join(OUT_DIR, "confusion_matrices.csv"), index=False)
 
+# LCS rule extraction (fold 1, the SAME improved model) 
+tr, te = folds[0]
+art = fold_artifacts[0]
+rule_model = fold1_models["eLCS improved"]
+top_k = art["top_k"]
+Xtr_sel, Xte_sel, yte = art["Xtr_e"][:, top_k], art["Xte_e"][:, top_k], y[te]
+feat_names = [art["train_clean"].columns[j] for j in top_k]
+labels = {c: list(m.keys()) for c, m in art["mappings"].items()}
+uniq_vals = [np.unique(Xtr_sel[:, a]) for a in range(Xtr_sel.shape[1])]
+print("Selected features:", feat_names)
+pd.Series(feat_names, name="top12_features_fold1").to_csv(os.path.join(OUT_DIR, "selected_features_fold1.csv"), index=False)
+
+def fmt(v):
+    return str(int(v)) if float(v).is_integer() else f"{v:.2f}"
+
+def inside(col, cond):                       # strict inequalities, same test as skeLCS matching
+    return (col > cond[0]) & (col < cond[1])
+
+def describe_condition(a, cond):
+    """Readable text for one rule condition, or None when it excludes nothing (no information)."""
+    name = feat_names[a]
+    if isinstance(cond, (list, tuple, np.ndarray)):
+        if name in labels:                   # category with >10 levels: interval over arbitrary integer codes
+            members = [str(labels[name][c]) for c in range(len(labels[name])) if cond[0] < c < cond[1]]
+            return None if len(members) == len(labels[name]) else f"{name} in [{', '.join(members)}]"
+        if inside(Xtr_sel[:, a], cond).mean() >= 0.99:
+            return None
+        vals = uniq_vals[a]
+        vin = vals[(vals > cond[0]) & (vals < cond[1])]       # observed values the interval really accepts
+        if len(vin) == 0:
+            return f"{name} matches no observed value"
+        lo_open, hi_open = vin.min() == vals.min(), vin.max() == vals.max()
+        if lo_open and hi_open: return None
+        if lo_open: return f"{name} <= {fmt(vin.max())}"
+        if hi_open: return f"{name} >= {fmt(vin.min())}"
+        return f"{name} = {fmt(vin.min())}" if vin.min() == vin.max() else f"{fmt(vin.min())} <= {name} <= {fmt(vin.max())}"
+    return f"{name} = {labels[name][int(cond)] if name in labels else fmt(cond)}"
+
+def describe_rule(rule):
+    parts = [t for t in (describe_condition(a, c) for a, c in zip(rule.specifiedAttList, rule.condition)) if t]
+    return " AND ".join(parts) if parts else "(always true)"
+
+def rule_matches(rule, Xm):
+    ok = np.ones(len(Xm), dtype=bool)
+    for a, cond in zip(rule.specifiedAttList, rule.condition):
+        col = Xm[:, a]
+        ok &= inside(col, cond) if isinstance(cond, (list, tuple, np.ndarray)) else (col == cond)
+    return ok
+
+base = yte.mean()
+rows, covered_any, covered_informative = [], np.zeros(len(Xte_sel), bool), np.zeros(len(Xte_sel), bool)
+for rule in rule_model.population.popSet:
+    m_ = rule_matches(rule, Xte_sel); n_m = int(m_.sum()); text = describe_rule(rule)
+    covered_any |= m_
+    if text != "(always true)":
+        covered_informative |= m_
+    rows.append({"rule": text, "predicts": int(rule.phenotype), "numerosity": int(rule.numerosity),
+                 "train_acc": rule.accuracy, "test_matches": n_m,
+                 "test_readmit_rate": yte[m_].mean() if n_m else np.nan})
+raw_rules = pd.DataFrame(rows)
+rules = (raw_rules.groupby(["rule", "predicts"], as_index=False)
+         .agg(numerosity=("numerosity", "sum"), n_merged=("numerosity", "size"), train_acc=("train_acc", "mean"),
+              test_matches=("test_matches", "mean"), test_readmit_rate=("test_readmit_rate", "mean")))
+n_always = int(rules.loc[rules.rule == "(always true)", "n_merged"].sum())
+rules = rules[rules.rule != "(always true)"].reset_index(drop=True)      # no conditions = no information
+rules["lift"] = rules["test_readmit_rate"] / base
+rules = rules.round(3)
+rules.to_csv(os.path.join(OUT_DIR, "rules_fold1.csv"), index=False)
+
+unmatched = ~covered_any
+fallback = np.bincount(rule_model.predict(Xte_sel[unmatched]).astype(int), minlength=2) if unmatched.any() else np.array([0, 0])
+cov = pd.DataFrame({"item": ["test_rows", "matched_by_any_rule", "matched_by_informative_rule", "unmatched_rows",
+                             "unmatched_predicted_0", "unmatched_predicted_1", "always_true_rules_removed", "distinct_informative_rules"],
+                    "value": [len(Xte_sel), int(covered_any.sum()), int(covered_informative.sum()), int(unmatched.sum()),
+                              int(fallback[0]), int(fallback[1]), n_always, len(rules)]})
+cov.to_csv(os.path.join(OUT_DIR, "rule_coverage_fold1.csv"), index=False)
+print(cov.to_string(index=False))
+print("Base readmission rate in the test fold:", round(base, 3))
+print("NOTE: train_acc is measured on the BALANCED training sample; compare rules using test match rate and lift.")
+
+pd.set_option("display.max_colwidth", None); pd.set_option("display.width", 250)
+for cls, title in [(1, "Rules predicting READMITTED"), (0, "Rules predicting NOT readmitted")]:
+    print("\n" + title + f" (top by numerosity, at least {MIN_RULE_MATCHES} held-out matches)")
+    print(rules[(rules.predicts == cls) & (rules.test_matches >= MIN_RULE_MATCHES)].sort_values("numerosity", ascending=False).head(8).to_string(index=False))
+print("\nRules that test number_inpatient (best lift first):")
+mask = rules["rule"].str.contains("number_inpatient") & (rules.test_matches >= MIN_RULE_MATCHES)
+print(rules[mask].sort_values("lift", ascending=False).head(6).to_string(index=False))
+
+
+
+
+
+
