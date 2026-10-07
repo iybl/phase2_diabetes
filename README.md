@@ -607,6 +607,94 @@ ci = pd.DataFrame(rows)
 ci.to_csv(os.path.join(OUT_DIR, "fairness_bootstrap_ci.csv"), index=False)
 print(ci.to_string(index=False))
 
+# figures for the report 
+plt.rcParams.update({"font.size": 9, "figure.dpi": 120})
+FIG = lambda name: os.path.join(FIG_DIR, name)
+colours = {"eLCS raw": "#9E9E9E", "eLCS cleaned": "#BDBDBD", "eLCS balanced (10k)": "#9ECAE1",
+           "eLCS balanced + top12 (10k)": "#4292C6", "eLCS improved": "#D55E00",
+           "Logistic regression": "#009E73", "Decision tree": "#E69F00", "Random forest": "#0072B2"}
+base_rate = y.mean()
+m_ = fold_results.groupby("model")[["ROC-AUC", "PR-AUC", "bal_acc"]].agg(["mean", "std"])
 
+# Figure 1: ablation of the eLCS stages plus conventional models (mean +/- SD over folds)
+fig, axs = plt.subplots(1, 3, figsize=(12, 3.8))
+for ax, met, title in zip(axs, ["ROC-AUC", "PR-AUC", "bal_acc"], ["ROC-AUC", "PR-AUC", "Balanced accuracy"]):
+    vals, err = m_.loc[MAIN, (met, "mean")], m_.loc[MAIN, (met, "std")].fillna(0)
+    ax.barh(range(len(MAIN)), vals, xerr=err, color=[colours[m] for m in MAIN], capsize=2)
+    ax.set_yticks(range(len(MAIN)))
+    ax.set_yticklabels([display_names[m] for m in MAIN] if met == "ROC-AUC" else [""] * len(MAIN))
+    ax.invert_yaxis(); ax.set_title(f"{title} (mean ± SD, {k_folds} folds)")
+    ax.set_xlim(max(0, vals.min() - 0.08), vals.max() + 0.05)
+    if met == "PR-AUC": ax.axvline(base_rate, ls=":", c="k", lw=0.8)
+    if met == "bal_acc": ax.axvline(0.5, ls=":", c="k", lw=0.8)
+plt.tight_layout(); plt.savefig(FIG("fig1_model_comparison.png"), dpi=200, bbox_inches="tight"); plt.show()
 
+# Figure 2: ROC and precision-recall curves, pooled out-of-fold predictions
+fig, axs = plt.subplots(1, 2, figsize=(10, 4.2))
+for name in ["eLCS raw", "eLCS balanced (10k)", "eLCS improved", "Logistic regression", "Decision tree", "Random forest"]:
+    te_, _, pb_ = pooled(name); yt_ = y[te_]
+    fpr, tpr, _ = roc_curve(yt_, pb_); pr_c, rc_c, _ = precision_recall_curve(yt_, pb_)
+    lw = 2.4 if name == "eLCS improved" else 1.2
+    axs[0].plot(fpr, tpr, color=colours[name], lw=lw, label=f"{display_names[name]} ({roc_auc_score(yt_, pb_):.3f})")
+    axs[1].plot(rc_c, pr_c, color=colours[name], lw=lw, label=display_names[name])
+axs[0].plot([0, 1], [0, 1], "k:", lw=0.8); axs[1].axhline(base_rate, color="k", ls=":", lw=0.8)
+axs[0].set(xlabel="False positive rate", ylabel="True positive rate", title="ROC (pooled test folds)")
+axs[1].set(xlabel="Recall", ylabel="Precision", title=f"Precision-recall (dotted = {base_rate:.1%} base rate)", ylim=(0, 0.6))
+axs[0].legend(fontsize=7, loc="lower right")
+plt.tight_layout(); plt.savefig(FIG("fig2_roc_pr.png"), dpi=200, bbox_inches="tight"); plt.show()
 
+# Figure 3: confusion matrices (pooled)
+show = ["eLCS raw", "eLCS improved", "Logistic regression", "Random forest"]
+fig, axs = plt.subplots(1, 4, figsize=(12, 3))
+for ax, name in zip(axs, show):
+    te_, pr_, _ = pooled(name); cm = confusion_matrix(y[te_], pr_, labels=[0, 1])
+    ax.imshow(cm, cmap="Blues")
+    for (r, c), v in np.ndenumerate(cm):
+        ax.text(c, r, f"{v:,}\n({v / cm[r].sum():.0%})", ha="center", va="center", fontsize=8,
+                color="white" if v > cm.max() / 2 else "black")
+    ax.set(xticks=[0, 1], yticks=[0, 1], xticklabels=["Pred 0", "Pred 1"], yticklabels=["True 0", "True 1"], title=display_names[name])
+plt.tight_layout(); plt.savefig(FIG("fig3_confusion_matrices.png"), dpi=200, bbox_inches="tight"); plt.show()
+
+# Figure 4: which features the (informative) rule conditions test, weighted by numerosity
+use = pd.Series(0.0, index=feat_names)
+for rule in rule_model.population.popSet:
+    for a, cond in zip(rule.specifiedAttList, rule.condition):
+        if describe_condition(a, cond) is not None:
+            use[feat_names[a]] += rule.numerosity
+use = (use / max(use.sum(), 1)).sort_values()
+fig, ax = plt.subplots(figsize=(7.5, 4.2))
+ax.barh(use.index, use.values, color="#D55E00", height=0.6)
+for yp, v in enumerate(use.values):
+    ax.text(v + 0.002, yp, f"{v:.1%}", va="center", fontsize=8)
+ax.set_xlabel("Share of informative rule conditions (weighted by numerosity)")
+ax.set_title("Which features the improved eLCS rules test (fold 1)")
+plt.tight_layout(); plt.savefig(FIG("fig4_feature_use.png"), dpi=200, bbox_inches="tight"); plt.show()
+
+# Figure 5: fairness forest plot (recall and ROC-AUC with patient-level bootstrap 95% CI)
+rank = {a: i for i, a in enumerate(age_order)}
+ci_plot = ci.assign(_k=[(0, rank.get(g, 9)) if a == "age band" else (1 if a == "race" else 2, 0) for a, g in zip(ci.attribute, ci.group)])
+ci_plot = ci_plot.sort_values(["_k", "group"]).reset_index(drop=True)
+ylab = [f"{a}: {g} (n={n:,})" for a, g, n in zip(ci_plot.attribute, ci_plot.group, ci_plot.n)]
+fig, axs = plt.subplots(1, 2, figsize=(11, 4.6), sharey=True)
+for ax, met, lo_c, hi_c in zip(axs, ["recall", "ROC-AUC"], ["recall_lo", "auc_lo"], ["recall_hi", "auc_hi"]):
+    ax.errorbar(ci_plot[met], range(len(ci_plot)), xerr=[ci_plot[met] - ci_plot[lo_c], ci_plot[hi_c] - ci_plot[met]],
+                fmt="o", color="#D55E00", capsize=3)
+    ax.set_yticks(range(len(ci_plot))); ax.set_yticklabels(ylab)
+    ax.set_title(f"Improved eLCS: {met} by subgroup (95% CI)"); ax.grid(axis="x", alpha=0.3)
+axs[0].invert_yaxis()
+plt.tight_layout(); plt.savefig(FIG("fig5_fairness_subgroups.png"), dpi=200, bbox_inches="tight"); plt.show()
+
+# Figure 6: most-reinforced rules and their lift on unseen test patients
+r_ = rules[rules.test_matches >= MIN_RULE_MATCHES]
+top = pd.concat([r_[r_.predicts == 1].nlargest(6, "numerosity"), r_[r_.predicts == 0].nlargest(4, "numerosity")])
+if len(top):
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    ax.barh(range(len(top)), top.lift, color=["#D55E00" if p_ == 1 else "#0072B2" for p_ in top.predicts])
+    ax.axvline(1, color="k", lw=0.8, ls=":")
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels([f"{t[:70]}{'…' if len(t) > 70 else ''}  (n={int(n):,})" for t, n in zip(top.rule, top.test_matches)], fontsize=7)
+    ax.invert_yaxis()
+    ax.set_xlabel("Lift = held-out readmission rate / base rate (orange: predicts readmitted, blue: predicts not readmitted)")
+    ax.set_title("Top eLCS rules (fold 1) checked on unseen test patients")
+    plt.tight_layout(); plt.savefig(FIG("fig6_top_rules_lift.png"), dpi=200, bbox_inches="tight"); plt.show()
+print("Saved figures to", FIG_DIR)
