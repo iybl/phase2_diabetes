@@ -242,7 +242,6 @@ def balanced_sample(idx, labels, rng):
     assert len(neg) >= len(pos), "Fewer negatives than positives, cannot balance 1:1"
     return rng.permutation(np.concatenate([pos, rng.choice(neg, size=len(pos), replace=False)]))
 
-
 # sanity check on fold 1
 tr, te = folds[0]
 p = preprocess_fold(tr, te)
@@ -255,6 +254,75 @@ assert p["Xtr_e"].shape[1] == p["Xte_e"].shape[1] and p["Xtr_c"].shape[1] == p["
 assert abs(y[tr][bal].mean() - 0.5) < 1e-9, "Balanced sample is not 50/50"
 print("balanced rows:", len(bal), "| positive share:", y[tr][bal].mean())
 
- 
+ # main experiment: all models, all folds (slow) 
+def metrics(yt_, pred_, proba_):
+    return {"acc": accuracy_score(yt_, pred_), "bal_acc": balanced_accuracy_score(yt_, pred_),
+            "precision": precision_score(yt_, pred_, zero_division=0), "recall": recall_score(yt_, pred_),
+            "F1": f1_score(yt_, pred_), "ROC-AUC": roc_auc_score(yt_, proba_),
+            "PR-AUC": average_precision_score(yt_, proba_)}
+
+MAIN = ["eLCS raw", "eLCS cleaned", "eLCS balanced (10k)", "eLCS balanced + top12 (10k)", "eLCS improved",
+        "Logistic regression", "Decision tree", "Random forest"]
+MATCHED = ["Logistic regression (matched)", "Decision tree (matched)", "Random forest (matched)"]
+
+def conventional_models():
+    return {"Logistic regression": make_pipeline(StandardScaler(), LogisticRegression(C=0.1, class_weight="balanced", max_iter=1000, random_state=SEED)),
+            "Decision tree": DecisionTreeClassifier(max_depth=4, min_samples_leaf=100, class_weight="balanced", random_state=SEED),
+            "Random forest": RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=50,
+                                                    class_weight="balanced_subsample", n_jobs=-1, random_state=SEED)}
+
+def matched_models():   # same balanced rows and same 12 features as the improved eLCS, no class weights
+    return {"Logistic regression (matched)": make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=1000, random_state=SEED)),
+            "Decision tree (matched)": DecisionTreeClassifier(max_depth=4, min_samples_leaf=50, random_state=SEED),
+            "Random forest (matched)": RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=50, n_jobs=-1, random_state=SEED)}
+
+all_rows, oof, fold_artifacts, fold1_models = [], {}, {}, {}
+
+def fit_and_score(k, te, name, model, Xa, ya, Xb):
+    t0 = time.time(); model.fit(Xa, ya); fit_s = time.time() - t0
+    t1 = time.time(); pred_ = model.predict(Xb); proba_ = model.predict_proba(Xb)[:, 1]; pred_s = time.time() - t1
+    all_rows.append({"fold": k + 1, "model": name, "fit_seconds": round(fit_s, 1),
+                     "predict_seconds": round(pred_s, 1), **metrics(y[te], pred_, proba_)})
+    oof.setdefault(name, []).append((te, pred_, proba_))
+    if k == 0 and name == "eLCS improved":
+        fold1_models[name] = model            # kept so Cell 12 explains the SAME model that was scored
+    return model
+
+def fit_elcs(k, te, name, Xa, ya, Xb, **kw):
+    return fit_and_score(k, te, name, eLCS(random_state=k + 1, **kw), Xa, ya, Xb)
+
+t_all = time.time()
+for k, (tr, te) in enumerate(folds):
+    ytr = y[tr]
+    prep = preprocess_fold(tr, te)
+    Xtr_e, Xte_e, Xtr_c, Xte_c = prep["Xtr_e"], prep["Xte_e"], prep["Xtr_c"], prep["Xte_c"]
+
+    raw_tr, raw_te = encode_raw(raw_df, tr, te)
+    fit_elcs(k, te, "eLCS raw", raw_tr, ytr, raw_te)
+    fit_elcs(k, te, "eLCS cleaned", Xtr_e, ytr, Xte_e)
+    bal_local = balanced_sample(np.arange(len(tr)), ytr, np.random.default_rng(BALANCE_SEED_BASE + k))
+    fit_elcs(k, te, "eLCS balanced (10k)", Xtr_e[bal_local], ytr[bal_local], Xte_e)
+    top_k = top_k_by_mutual_info(Xtr_e, ytr, prep["discrete_mask"])
+    prep["top_k"], prep["bal_idx"] = top_k, bal_local
+    fold_artifacts[k] = prep
+    fit_elcs(k, te, "eLCS balanced + top12 (10k)", Xtr_e[bal_local][:, top_k], ytr[bal_local], Xte_e[:, top_k])
+    fit_elcs(k, te, "eLCS improved", Xtr_e[bal_local][:, top_k], ytr[bal_local], Xte_e[:, top_k],
+             learning_iterations=IMPROVED_ITERATIONS)
+
+    for name, mod in conventional_models().items():
+        fit_and_score(k, te, name, mod, Xtr_c, ytr, Xte_c)
+
+    feat_cols = list(prep["train_clean"].columns[top_k])
+    Xtr_m, Xte_m, _ = encode_conventional(prep["train_clean"].iloc[bal_local][feat_cols], prep["test_clean"][feat_cols])
+    for name, mod in matched_models().items():
+        fit_and_score(k, te, name, mod, Xtr_m, ytr[bal_local], Xte_m)
+
+    pd.DataFrame(all_rows).to_csv(os.path.join(OUT_DIR, "fold_results.csv"), index=False)   # checkpoint after every fold
+    print(f"fold {k + 1} done ({round(time.time() - t_all)} s elapsed, checkpoint saved) | dropped near-constant drugs: {prep['near_constant']}")
+
+fold_results = pd.DataFrame(all_rows)
+fold_results.to_csv(os.path.join(OUT_DIR, "fold_results.csv"), index=False)
+print(fold_results[["model", "acc", "bal_acc", "recall", "ROC-AUC", "PR-AUC", "fit_seconds", "predict_seconds"]].round(3).to_string(index=False))
+
 
 
